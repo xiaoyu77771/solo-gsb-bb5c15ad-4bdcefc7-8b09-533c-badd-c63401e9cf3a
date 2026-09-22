@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 
 from . import __version__
 from .bundle import build_bundle, decode_bundle_base64, verify_bundle
@@ -34,6 +37,10 @@ from .impact import build_impact
 from .models import (
     AuditResponse,
     AuditSummary,
+    BatchAuditError,
+    BatchAuditIn,
+    BatchAuditItemOut,
+    BatchAuditResponse,
     BundleExportIn,
     BundleExportResponse,
     BundleVerifyIn,
@@ -46,8 +53,11 @@ from .models import (
 from .semver import Version, VersionError
 from .solver import Solver
 
+logger = logging.getLogger(__name__)
+
 SEED_PATH = os.environ.get("AUDIT_SEED_PATH", "/app/data/seed_registry.json")
 MAX_LIMIT = 100
+BATCH_MAX_ITEMS = 20
 
 
 @asynccontextmanager
@@ -99,6 +109,7 @@ def index() -> dict:
         "endpoints": [
             "GET /health",
             "POST /api/v1/audits",
+            "POST /api/v1/audits/batch",
             "GET /api/v1/audits",
             "GET /api/v1/audits/{audit_id}",
             "GET /api/v1/audits/impact/{package_name}",
@@ -127,29 +138,35 @@ def health(request: Request) -> HealthResponse:
     )
 
 
-@app.post(
-    "/api/v1/audits",
-    response_model=AuditResponse,
-    status_code=status.HTTP_201_CREATED,
-    tags=["audits"],
-)
-def create_audit(manifest: ManifestIn, request: Request) -> AuditResponse:
-    try:
-        manifest.validate_root_consistency()
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+class _RootPluginNotFound(Exception):
+    """根插件版本不存在于注册表（单条接口映射为 422，批量接口映射为单项错误）。"""
 
-    conn = get_conn(request)
-    registry = load_registry(conn)
+
+def _root_label(manifest: ManifestIn) -> Optional[str]:
+    if not manifest.plugin_name:
+        return None
+    if manifest.plugin_version:
+        return f"{manifest.plugin_name}@{manifest.plugin_version}"
+    return manifest.plugin_name
+
+
+def _solve_manifest(
+    manifest: ManifestIn, registry: dict
+) -> tuple[Any, Optional[str], Optional[str]]:
+    """校验清单并运行求解器，返回 (result, root_label, root_version)。
+
+    仅做内存中的校验与求解，不触碰数据库。
+    """
+    manifest.validate_root_consistency()
 
     # 根插件版本必须存在于注册表（若声明了根插件）
-    if manifest.plugin_name is not None and manifest.plugin_version not in registry.get(manifest.plugin_name, {}):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"根插件 {manifest.plugin_name}@{manifest.plugin_version} 不存在于注册表；"
-                f"可用版本：{sorted(registry.get(manifest.plugin_name, {}), reverse=True)}"
-            ),
+    if (
+        manifest.plugin_name is not None
+        and manifest.plugin_version not in registry.get(manifest.plugin_name, {})
+    ):
+        raise _RootPluginNotFound(
+            f"根插件 {manifest.plugin_name}@{manifest.plugin_version} 不存在于注册表；"
+            f"可用版本：{sorted(registry.get(manifest.plugin_name, {}), reverse=True)}"
         )
 
     solver = Solver(registry)
@@ -158,40 +175,175 @@ def create_audit(manifest: ManifestIn, request: Request) -> AuditResponse:
         root_name=manifest.plugin_name,
         root_version=manifest.plugin_version,
     )
+    return result, _root_label(manifest), manifest.plugin_version
 
+
+def _build_audit_body(
+    manifest: ManifestIn, result: Any, root_label: Optional[str], root_version: Optional[str]
+) -> tuple[str, str, dict]:
+    """组装待持久化/返回的审计体，返回 (audit_id, created_at, body)。"""
     audit_id = str(uuid.uuid4())
     created_at = datetime.now(timezone.utc).isoformat()
-    root_label = None
-    if manifest.plugin_name:
-        root_label = manifest.plugin_name
-        if manifest.plugin_version:
-            root_label = f"{manifest.plugin_name}@{manifest.plugin_version}"
-
     body = {
         "id": audit_id,
         "created_at": created_at,
         "status": result.status,
         "root_plugin": root_label,
-        "root_version": manifest.plugin_version,
+        "root_version": root_version,
         "explanation": result.explanation,
         "node_count": result.node_count,
         "resolution": result.resolution,
         "sources": result.sources,
         "conflicts": result.conflicts,
     }
+    return audit_id, created_at, body
+
+
+def _persist_audit(
+    conn: sqlite3.Connection,
+    manifest: ManifestIn,
+    result: Any,
+    audit_id: str,
+    created_at: str,
+    body: dict,
+    root_label: Optional[str],
+    root_version: Optional[str],
+) -> None:
     insert_audit(
         conn,
         audit_id=audit_id,
         created_at=created_at,
         status=result.status,
         root_plugin=root_label,
-        root_version=manifest.plugin_version,
+        root_version=root_version,
         dependency_count=len(manifest.dependencies),
         manifest=manifest.model_dump(mode="json"),
         result=body,
         node_count=result.node_count,
     )
+
+
+@app.post(
+    "/api/v1/audits",
+    response_model=AuditResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["audits"],
+)
+def create_audit(manifest: ManifestIn, request: Request) -> AuditResponse:
+    conn = get_conn(request)
+    registry = load_registry(conn)
+
+    try:
+        result, root_label, root_version = _solve_manifest(manifest, registry)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except _RootPluginNotFound as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    audit_id, created_at, body = _build_audit_body(manifest, result, root_label, root_version)
+    _persist_audit(
+        conn, manifest, result, audit_id, created_at, body, root_label, root_version
+    )
     return AuditResponse(**body)
+
+
+@app.post(
+    "/api/v1/audits/batch",
+    response_model=BatchAuditResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["audits"],
+    summary="批量审计：1～20 个清单按输入顺序独立求解并逐项持久化",
+)
+def create_audits_batch(payload: BatchAuditIn, request: Request) -> BatchAuditResponse:
+    """逐项独立运行求解器并落库，单项失败不影响其他项。
+
+    * 每个清单项单独做 Pydantic 校验与根插件检查，失败仅记为该项的结构化 error；
+    * 求解器或持久化抛出的异常同样隔离在该项内；
+    * 成功项与单条 ``POST /api/v1/audits`` 行为完全一致（独立 audit_id、独立落库）；
+    * ``items`` 顺序与请求 ``manifests`` 一致，计数覆盖全部输入项。
+    """
+    conn = get_conn(request)
+    # 注册表在本批次开始时加载一次，供全部项共享（各项之间不产生新注册表数据）
+    registry = load_registry(conn)
+
+    items: list[BatchAuditItemOut] = []
+    counts = {"feasible": 0, "infeasible": 0, "inconclusive": 0, "error": 0}
+
+    for index, raw in enumerate(payload.manifests):
+        # ---- 阶段一：逐项校验 + 求解（纯内存） ----
+        try:
+            manifest = ManifestIn.model_validate(raw)
+            result, root_label, root_version = _solve_manifest(manifest, registry)
+            audit_id, created_at, body = _build_audit_body(
+                manifest, result, root_label, root_version
+            )
+        except ValidationError as exc:
+            counts["error"] += 1
+            items.append(
+                BatchAuditItemOut(
+                    index=index,
+                    error=BatchAuditError(
+                        code="invalid_manifest",
+                        message="清单校验失败",
+                        details=jsonable_encoder(exc.errors()),
+                    ),
+                )
+            )
+            continue
+        except (_RootPluginNotFound, ValueError) as exc:
+            counts["error"] += 1
+            items.append(
+                BatchAuditItemOut(
+                    index=index,
+                    error=BatchAuditError(code="invalid_manifest", message=str(exc)),
+                )
+            )
+            continue
+        except Exception:  # noqa: BLE001 - 单项求解异常不得影响其他项
+            logger.exception("批量审计第 %d 项求解失败", index)
+            counts["error"] += 1
+            items.append(
+                BatchAuditItemOut(
+                    index=index,
+                    error=BatchAuditError(code="solver_error", message="求解过程中发生内部错误"),
+                )
+            )
+            continue
+
+        # ---- 阶段二：逐项持久化（独立事务） ----
+        try:
+            _persist_audit(
+                conn, manifest, result, audit_id, created_at, body, root_label, root_version
+            )
+        except Exception:  # noqa: BLE001 - 单项落库异常不得影响其他项
+            logger.exception("批量审计第 %d 项持久化失败", index)
+            counts["error"] += 1
+            items.append(
+                BatchAuditItemOut(
+                    index=index,
+                    error=BatchAuditError(code="internal_error", message="审计结果持久化失败"),
+                )
+            )
+            continue
+
+        counts[result.status] += 1
+        items.append(
+            BatchAuditItemOut(
+                index=index,
+                audit_id=audit_id,
+                status=result.status,
+                audit=AuditResponse(**body),
+            )
+        )
+
+    return BatchAuditResponse(
+        total=len(payload.manifests),
+        feasible=counts["feasible"],
+        infeasible=counts["infeasible"],
+        inconclusive=counts["inconclusive"],
+        error=counts["error"],
+        items=items,
+    )
 
 
 @app.get("/api/v1/audits", response_model=dict, tags=["audits"])

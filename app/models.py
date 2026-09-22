@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -156,6 +156,64 @@ class AuditResponse(BaseModel):
     resolution: Optional[Dict[str, str]]
     sources: Optional[List[ResolutionSourceOut]]
     conflicts: List[ConflictOut]
+
+
+# ---------- 批量审计 ----------
+
+
+class BatchAuditIn(BaseModel):
+    """批量审计请求：1～20 个待审计清单（原始字典，逐项独立校验）。"""
+
+    manifests: List[Any] = Field(
+        ...,
+        min_length=1,
+        max_length=20,
+        description="按输入顺序逐个审计的清单列表，数量 1～20；元素格式与单条 POST /api/v1/audits 请求体一致",
+    )
+
+
+class BatchAuditError(BaseModel):
+    """单项审计失败时的结构化错误。"""
+
+    code: Literal["invalid_manifest", "solver_error", "internal_error"] = Field(
+        ...,
+        description=(
+            "invalid_manifest=清单校验失败（非法 SemVer/范围、根插件不存在等 422 类问题）；"
+            "solver_error=求解过程异常；internal_error=持久化等服务端异常"
+        ),
+    )
+    message: str
+    details: Optional[List[Dict[str, Any]]] = Field(
+        None, description="结构化校验细节（Pydantic 错误列表），仅 invalid_manifest 可能携带"
+    )
+
+
+class BatchAuditItemOut(BaseModel):
+    """批量结果中的单项：成功携带 audit_id/status/审计结果，失败携带 error。"""
+
+    index: int = Field(..., description="该项在请求 manifests 中的下标（0 起）")
+    audit_id: Optional[str] = Field(None, description="审计记录 ID；失败时为 null")
+    status: Optional[Literal["feasible", "infeasible", "inconclusive"]] = Field(
+        None, description="求解状态；失败时为 null"
+    )
+    audit: Optional[AuditResponse] = Field(
+        None, description="完整审计结果（与 GET /api/v1/audits/{id} 同构）；失败时为 null"
+    )
+    error: Optional[BatchAuditError] = Field(None, description="结构化错误；成功时为 null")
+
+
+class BatchAuditResponse(BaseModel):
+    total: int = Field(..., description="提交的清单总数（1～20）")
+    feasible: int = Field(..., description="可行（feasible）项数")
+    infeasible: int = Field(..., description="无解（infeasible）项数")
+    inconclusive: int = Field(..., description="预算内无法判定（inconclusive）项数")
+    error: int = Field(..., description="校验失败或求解异常的项数")
+    items: List[BatchAuditItemOut] = Field(
+        ..., description="逐项结果，顺序与请求 manifests 完全一致"
+    )
+
+
+# ---------- 历史影响反查 ----------
 
 
 # ---------- 历史影响反查 ----------

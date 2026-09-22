@@ -118,7 +118,76 @@ curl -s 'http://localhost:8000/api/v1/audits?status=infeasible' | jq
 curl -s http://localhost:8000/api/v1/audits/<id> | jq
 ```
 
-### 4. 历史影响反查：某个包/版本被哪些审计依赖过
+### 4. 批量审计（1～20 个清单，逐项独立落库）
+
+一次提交 1～20 个清单，服务**按输入顺序**对每个清单独立运行求解器并分别持久化：
+单个清单校验失败、根插件不存在或求解异常**都不会阻止其他项**，
+响应逐项返回 `audit_id` + `status`（成功）或结构化 `error`（失败），
+并给出 `total` / `feasible` / `infeasible` / `inconclusive` / `error` 计数。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/audits/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"manifests":[
+    {"dependencies":[{"name":"core-lib","range":"^1.0.0"}]},
+    {"dependencies":[{"name":"cachekit","range":"^1.0.0"},{"name":"loggerkit","range":"^0.9.0"}]},
+    {"dependencies":[{"name":"x","range":"not-valid"}]}
+  ]}' | jq
+```
+
+返回（节选）：
+
+```json
+{
+  "total": 3,
+  "feasible": 1,
+  "infeasible": 1,
+  "inconclusive": 0,
+  "error": 1,
+  "items": [
+    {
+      "index": 0,
+      "audit_id": "…",
+      "status": "feasible",
+      "audit": { "id": "…", "status": "feasible", "resolution": {"core-lib": "1.5.0"} },
+      "error": null
+    },
+    {
+      "index": 1,
+      "audit_id": "…",
+      "status": "infeasible",
+      "audit": { "id": "…", "status": "infeasible", "conflicts": [ … ] },
+      "error": null
+    },
+    {
+      "index": 2,
+      "audit_id": null,
+      "status": null,
+      "audit": null,
+      "error": {
+        "code": "invalid_manifest",
+        "message": "清单校验失败",
+        "details": [ {"loc": ["dependencies", 0, "range"], "msg": "非法版本范围 'not-valid' …"} ]
+      }
+    }
+  ]
+}
+```
+
+要点：
+
+- **逐项隔离**：每个元素单独做 Pydantic 校验（元素不是对象、字段类型错误等也只挂在该项），
+  根插件版本缺失、求解器异常、落库异常都仅记为该项错误，其余项照常处理；
+- **成功项与单条接口完全等价**：各自生成独立 `audit_id`、独立事务落库，
+  之后可用 `GET /api/v1/audits/{id}` 取回，`audit` 字段与单条响应同构；
+- **失败项不产生审计记录**；错误码：
+  `invalid_manifest`（清单非法/根插件缺失，携带 Pydantic `details`）、
+  `solver_error`（求解内部异常）、`internal_error`（持久化异常）；
+- `items` 顺序与请求 `manifests` 完全一致；
+- 仅当整个批量请求**为空列表或超过 20 项**（或缺字段）时返回 `422`，此时不落任何记录；
+  单项问题一律返回 `200` 并在该项的 `error` 中体现。
+
+### 5. 历史影响反查：某个包/版本被哪些审计依赖过
 
 扫描**已持久化**审计结果的 `resolution`、`sources` 与 `conflicts`，沿来源链找出
 直接或传递依赖该包（可选精确版本）的审计记录：
@@ -207,7 +276,7 @@ curl -s 'http://localhost:8000/api/v1/audits/impact/core-lib?version=2.0.0&statu
 - **未知包返回 `200` 空结果（`total=0`、`items=[]`），不返回 404**；
   非法 SemVer 版本参数返回 `422`。
 
-### 5. 导出可验证审计包并校验
+### 6. 导出可验证审计包并校验
 
 把**按创建时间排序**的 `audit_id` 列表（1～100 个、不可重复）交给导出接口，
 得到确定性的 JSONL 导出包：每条记录是规范化 JSON（键排序、紧凑、UTF-8），
@@ -306,6 +375,7 @@ def verify(gzip_base64):
 | --- | --- | --- |
 | `GET`  | `/health` | 健康检查（含数据库连通性与注册表包数量） |
 | `POST` | `/api/v1/audits` | 提交清单进行审计，返回求解结果并落库（`201`） |
+| `POST` | `/api/v1/audits/batch` | 批量审计 1～20 个清单：按序独立求解并分别落库，逐项返回 audit_id/status 或结构化 error（`200`；空列表或超过 20 项返回 `422`） |
 | `GET`  | `/api/v1/audits` | 审计记录列表，支持 `status` / `limit` / `offset` |
 | `GET`  | `/api/v1/audits/{id}` | 查询单条审计的完整结果 |
 | `GET`  | `/api/v1/audits/impact/{package_name}` | 历史影响反查：扫描 resolution/sources/conflicts，找直接或传递依赖该包/版本的审计（可选 `version` / `status` / `limit`），未知包返回空结果而非 404 |
@@ -328,7 +398,9 @@ def verify(gzip_base64):
 
 - 根插件在注册表中声明的依赖会作为传递依赖自动纳入解析；
 - `dependencies` 是清单直接声明的根约束；
-- 状态码：非法 SemVer / 范围返回 `422`，审计记录不存在返回 `404`。
+- 状态码：单条接口非法 SemVer / 范围 / 根插件缺失返回 `422`，审计记录不存在返回 `404`；
+  批量接口中这类问题只作为该项的 `invalid_manifest` 错误返回（整体仍为 `200`），
+  仅空列表 / 超过 20 项 / 缺字段时整体返回 `422`。
 
 ### 支持的范围语法（npm 风格）
 
@@ -359,6 +431,7 @@ pytest -q
 
 测试覆盖 SemVer 解析（含预发布排序与 npm 范围语义）、求解器
 （可行/无解/深层传递/多冲突枚举/预算保护）、全部 HTTP 接口（临时 SQLite，互不污染）、
+批量审计（混合结果逐项隔离与计数、空/超限 422、求解与持久化异常隔离、成功项分别落库）、
 历史影响反查（resolution/冲突约束/来源链命中、层级与稳定排序、版本聚合、未知包空结果），
 以及导出包的确定性、重复/未知 ID 错误码与逐字节/顺序篡改识别。
 
