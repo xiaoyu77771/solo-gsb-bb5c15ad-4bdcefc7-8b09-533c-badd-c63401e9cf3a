@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
 from .semver import Version, VersionError, VersionRange
+
+# 批量审计一次最多接收的清单项数
+BATCH_MAX_ITEMS = 20
 
 
 class DependencySpec(BaseModel):
@@ -57,6 +60,74 @@ class ManifestIn(BaseModel):
     def validate_root_consistency(self) -> None:
         if (self.plugin_name is None) != (self.plugin_version is None):
             raise ValueError("plugin_name 与 plugin_version 必须同时提供或同时省略")
+
+
+# ---------- 批量审计 ----------
+
+
+class BatchAuditIn(BaseModel):
+    """批量审计请求：按输入顺序独立求解的 1～20 份清单。
+
+    列表元素刻意不声明为 ``ManifestIn``：单项清单本身的校验失败（如非法版本范围、
+    元素甚至不是 JSON 对象）必须降级为该项的结构化 error，而不能让整个批量请求 422。
+    因此单项校验在路由内逐项进行；这里只保证外层列表长度合法。
+    """
+
+    manifests: List[Any] = Field(
+        ...,
+        min_length=1,
+        max_length=BATCH_MAX_ITEMS,
+        description=f"待审计清单，按输入顺序逐项独立求解并落库（1～{BATCH_MAX_ITEMS} 项）",
+    )
+
+
+class BatchItemError(BaseModel):
+    """单个清单项的结构化错误。"""
+
+    code: Literal["invalid_manifest", "solver_error"] = Field(
+        ...,
+        description=(
+            "invalid_manifest=清单校验失败（字段非法/根插件名版本不一致/根版本不存在）；"
+            "solver_error=求解或落库过程中抛出异常"
+        ),
+    )
+    message: str
+    details: Optional[List[Dict[str, Any]]] = Field(
+        None,
+        description="Pydantic 结构化校验错误（loc/msg/type/input），仅 invalid_manifest 时可能存在",
+    )
+
+
+class BatchAuditItem(BaseModel):
+    """批量审计中一项的结果：成功带 audit（含 audit_id 与 status），失败带 error。"""
+
+    index: int = Field(..., description="该项在请求中的下标（0 起，与输入顺序一致）")
+    audit_id: Optional[str] = None
+    status: Optional[Literal["feasible", "infeasible", "inconclusive"]] = None
+    audit: Optional[AuditResponse] = Field(
+        None, description="成功时为与 POST /api/v1/audits 完全一致的审计结果"
+    )
+    error: Optional[BatchItemError] = None
+
+
+class BatchAuditCounts(BaseModel):
+    total: int
+    feasible: int
+    infeasible: int
+    inconclusive: int
+    error: int
+
+
+class BatchAuditResponse(BaseModel):
+    total: int = Field(..., description="本次批处理的清单项数（1～20）")
+    feasible: int
+    infeasible: int
+    inconclusive: int
+    error: int = Field(..., description="校验失败或求解异常的项数")
+    counts: BatchAuditCounts
+    results: List[BatchAuditItem] = Field(
+        ..., description="逐项结果，顺序与请求 manifests 完全一致"
+    )
 
 
 class PackageVersionIn(BaseModel):

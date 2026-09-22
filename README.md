@@ -7,6 +7,8 @@
 - **无解时不会只报第一个冲突**：遍历整棵搜索树，汇总所有本质不同的死路，
   对每条死路的约束集合做贪心极小化，返回**最小冲突链**以及链上**每一条约束的逐跳来源**；
 - 所有审计结果持久化到 SQLite，支持按 ID 查询、列表过滤；
+- 支持**批量审计**（`POST /api/v1/audits/batch`，一次 1～20 份清单），
+  逐项独立求解并分别落库，单项校验失败/求解异常不影响其他项；
 - 自带健康检查、OpenAPI 文档、示例注册表与一键 Docker Compose 启动。
 
 ## 一条命令启动
@@ -118,7 +120,82 @@ curl -s 'http://localhost:8000/api/v1/audits?status=infeasible' | jq
 curl -s http://localhost:8000/api/v1/audits/<id> | jq
 ```
 
-### 4. 历史影响反查：某个包/版本被哪些审计依赖过
+### 4. 批量审计（一次 1～20 份，单项失败互不影响）
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/audits/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"manifests":[
+    {"dependencies":[{"name":"core-lib","range":"^1.0.0"}]},
+    {"dependencies":[{"name":"core-lib","range":"不是合法范围"}]},
+    {"dependencies":[
+      {"name":"cachekit","range":"^1.0.0"},
+      {"name":"loggerkit","range":"^0.9.0"}
+    ]}
+  ]}' | jq
+```
+
+请求体形如 `{"manifests": [...]}`，每个元素与单条接口的清单格式完全相同。
+清单**按输入顺序逐项独立运行求解器并分别持久化**；返回的 `results` 与输入同序，
+每项带 `index`（0 起）：
+
+- 成功项：`audit_id`、`status`（`feasible` / `infeasible` / `inconclusive`），
+  以及与单条接口完全一致的完整结果 `audit`；
+- 失败项：`audit_id`、`status`、`audit` 均为 `null`，`error` 给出结构化错误：
+  - `invalid_manifest`：清单本身校验失败（非法 SemVer/范围、`plugin_name` 与
+    `plugin_version` 未成对提供、根插件版本不在注册表、元素不是 JSON 对象等），
+    `details` 给出 Pydantic 风格的定位信息（`loc` / `msg` / `type` / `input`）；
+  - `solver_error`：求解或落库过程中发生未预期异常，`message` 为错误信息。
+
+`total`、`feasible`、`infeasible`、`inconclusive`、`error` 为计数（同时嵌在
+`counts` 中）；单项失败只计入 `error`，**不会**让整个请求失败，也不会阻止其他项落库。
+外层 `manifests` 为空或超过 20 项时整个请求直接返回 `422`（不执行任何一项）；
+批量接口整体返回 `200`（即便其中有 error 项）。
+
+示例响应（节选）：
+
+```json
+{
+  "total": 3,
+  "feasible": 1,
+  "infeasible": 1,
+  "inconclusive": 0,
+  "error": 1,
+  "counts": {"total": 3, "feasible": 1, "infeasible": 1, "inconclusive": 0, "error": 1},
+  "results": [
+    {
+      "index": 0,
+      "audit_id": "…",
+      "status": "feasible",
+      "audit": { "id": "…", "status": "feasible", "resolution": {"core-lib": "1.5.0"} },
+      "error": null
+    },
+    {
+      "index": 1,
+      "audit_id": null,
+      "status": null,
+      "audit": null,
+      "error": {
+        "code": "invalid_manifest",
+        "message": "清单校验失败",
+        "details": [
+          {"loc": ["dependencies", 0, "range"], "msg": "…", "type": "value_error",
+           "input": "不是合法范围"}
+        ]
+      }
+    },
+    {
+      "index": 2,
+      "audit_id": "…",
+      "status": "infeasible",
+      "audit": { "id": "…", "status": "infeasible", "conflicts": [ /* … */ ] },
+      "error": null
+    }
+  ]
+}
+```
+
+### 5. 历史影响反查：某个包/版本被哪些审计依赖过
 
 扫描**已持久化**审计结果的 `resolution`、`sources` 与 `conflicts`，沿来源链找出
 直接或传递依赖该包（可选精确版本）的审计记录：
@@ -207,7 +284,7 @@ curl -s 'http://localhost:8000/api/v1/audits/impact/core-lib?version=2.0.0&statu
 - **未知包返回 `200` 空结果（`total=0`、`items=[]`），不返回 404**；
   非法 SemVer 版本参数返回 `422`。
 
-### 5. 导出可验证审计包并校验
+### 6. 导出可验证审计包并校验
 
 把**按创建时间排序**的 `audit_id` 列表（1～100 个、不可重复）交给导出接口，
 得到确定性的 JSONL 导出包：每条记录是规范化 JSON（键排序、紧凑、UTF-8），
@@ -306,6 +383,7 @@ def verify(gzip_base64):
 | --- | --- | --- |
 | `GET`  | `/health` | 健康检查（含数据库连通性与注册表包数量） |
 | `POST` | `/api/v1/audits` | 提交清单进行审计，返回求解结果并落库（`201`） |
+| `POST` | `/api/v1/audits/batch` | 批量审计 1～20 份清单，按输入顺序独立求解并分别落库；单项失败不影响其他项，逐项返回 audit/status 或结构化 error 及计数（`200`；空列表/超过 20 项为 `422`） |
 | `GET`  | `/api/v1/audits` | 审计记录列表，支持 `status` / `limit` / `offset` |
 | `GET`  | `/api/v1/audits/{id}` | 查询单条审计的完整结果 |
 | `GET`  | `/api/v1/audits/impact/{package_name}` | 历史影响反查：扫描 resolution/sources/conflicts，找直接或传递依赖该包/版本的审计（可选 `version` / `status` / `limit`），未知包返回空结果而非 404 |
@@ -329,6 +407,9 @@ def verify(gzip_base64):
 - 根插件在注册表中声明的依赖会作为传递依赖自动纳入解析；
 - `dependencies` 是清单直接声明的根约束；
 - 状态码：非法 SemVer / 范围返回 `422`，审计记录不存在返回 `404`。
+- 批量接口（`POST /api/v1/audits/batch`）请求体为 `{"manifests": [ <清单>, … ]}`，
+  单项清单非法时不返回 422，而是在该项结果中给出结构化 `error`；仅外层为空或
+  超过 20 项时整体返回 `422`。
 
 ### 支持的范围语法（npm 风格）
 
@@ -359,6 +440,8 @@ pytest -q
 
 测试覆盖 SemVer 解析（含预发布排序与 npm 范围语义）、求解器
 （可行/无解/深层传递/多冲突枚举/预算保护）、全部 HTTP 接口（临时 SQLite，互不污染）、
+批量审计（混合状态计数、输入顺序、逐项校验失败/求解异常隔离与不落库、空列表/超 20 项 422、
+恰好 20 项、单条接口行为不变）、
 历史影响反查（resolution/冲突约束/来源链命中、层级与稳定排序、版本聚合、未知包空结果），
 以及导出包的确定性、重复/未知 ID 错误码与逐字节/顺序篡改识别。
 

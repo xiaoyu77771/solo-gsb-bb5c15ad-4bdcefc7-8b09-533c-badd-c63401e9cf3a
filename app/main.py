@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import uuid
@@ -14,6 +15,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 
 from . import __version__
 from .bundle import build_bundle, decode_bundle_base64, verify_bundle
@@ -34,6 +36,11 @@ from .impact import build_impact
 from .models import (
     AuditResponse,
     AuditSummary,
+    BatchAuditCounts,
+    BatchAuditIn,
+    BatchAuditItem,
+    BatchAuditResponse,
+    BatchItemError,
     BundleExportIn,
     BundleExportResponse,
     BundleVerifyIn,
@@ -45,6 +52,8 @@ from .models import (
 )
 from .semver import Version, VersionError
 from .solver import Solver
+
+logger = logging.getLogger(__name__)
 
 SEED_PATH = os.environ.get("AUDIT_SEED_PATH", "/app/data/seed_registry.json")
 MAX_LIMIT = 100
@@ -99,6 +108,7 @@ def index() -> dict:
         "endpoints": [
             "GET /health",
             "POST /api/v1/audits",
+            "POST /api/v1/audits/batch",
             "GET /api/v1/audits",
             "GET /api/v1/audits/{audit_id}",
             "GET /api/v1/audits/impact/{package_name}",
@@ -127,29 +137,21 @@ def health(request: Request) -> HealthResponse:
     )
 
 
-@app.post(
-    "/api/v1/audits",
-    response_model=AuditResponse,
-    status_code=status.HTTP_201_CREATED,
-    tags=["audits"],
-)
-def create_audit(manifest: ManifestIn, request: Request) -> AuditResponse:
-    try:
-        manifest.validate_root_consistency()
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+def _run_single_audit(manifest: ManifestIn, conn: sqlite3.Connection) -> AuditResponse:
+    """校验一份清单、运行求解器并持久化。
 
-    conn = get_conn(request)
+    单条接口与批量接口共用此函数：清单校验失败抛 ``ValueError``（单条接口转 422），
+    其余异常（求解器/持久化等）直接向上抛，由调用方决定处理方式。
+    """
+    manifest.validate_root_consistency()
+
     registry = load_registry(conn)
 
     # 根插件版本必须存在于注册表（若声明了根插件）
     if manifest.plugin_name is not None and manifest.plugin_version not in registry.get(manifest.plugin_name, {}):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"根插件 {manifest.plugin_name}@{manifest.plugin_version} 不存在于注册表；"
-                f"可用版本：{sorted(registry.get(manifest.plugin_name, {}), reverse=True)}"
-            ),
+        raise ValueError(
+            f"根插件 {manifest.plugin_name}@{manifest.plugin_version} 不存在于注册表；"
+            f"可用版本：{sorted(registry.get(manifest.plugin_name, {}), reverse=True)}"
         )
 
     solver = Solver(registry)
@@ -192,6 +194,113 @@ def create_audit(manifest: ManifestIn, request: Request) -> AuditResponse:
         node_count=result.node_count,
     )
     return AuditResponse(**body)
+
+
+@app.post(
+    "/api/v1/audits",
+    response_model=AuditResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["audits"],
+)
+def create_audit(manifest: ManifestIn, request: Request) -> AuditResponse:
+    try:
+        return _run_single_audit(manifest, get_conn(request))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/v1/audits/batch",
+    response_model=BatchAuditResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["audits"],
+    summary="批量审计：一次提交 1～20 份清单，按输入顺序独立求解并分别落库",
+)
+def create_audits_batch(payload: BatchAuditIn, request: Request) -> BatchAuditResponse:
+    """单项清单校验失败或求解/落库异常不会中断其余项：
+
+    成功项返回与 ``POST /api/v1/audits`` 完全一致的结果（含 ``audit_id``、``status``）；
+    失败项 ``audit_id`` / ``status`` 为 ``null``，并在 ``error`` 中给出结构化错误
+    （``invalid_manifest`` 或 ``solver_error``）。外层空列表或超过 20 项返回 422。
+    """
+    conn = get_conn(request)
+    results: list[BatchAuditItem] = []
+    counts = {"feasible": 0, "infeasible": 0, "inconclusive": 0, "error": 0}
+
+    for index, raw in enumerate(payload.manifests):
+        try:
+            manifest = ManifestIn.model_validate(raw)
+            audit = _run_single_audit(manifest, conn)
+        except ValidationError as exc:
+            # 只保留 JSON 可序列化字段（Pydantic 的 ctx 中可能携带原始异常对象）
+            details = [
+                {
+                    "loc": list(err.get("loc", [])),
+                    "msg": err.get("msg"),
+                    "type": err.get("type"),
+                    "input": err.get("input"),
+                }
+                for err in exc.errors(include_url=False)
+            ]
+            results.append(
+                BatchAuditItem(
+                    index=index,
+                    error=BatchItemError(
+                        code="invalid_manifest",
+                        message="清单校验失败",
+                        details=details,
+                    ),
+                )
+            )
+            counts["error"] += 1
+            continue
+        except ValueError as exc:
+            # validate_root_consistency / 根插件版本不存在
+            results.append(
+                BatchAuditItem(
+                    index=index,
+                    error=BatchItemError(
+                        code="invalid_manifest",
+                        message=str(exc),
+                    ),
+                )
+            )
+            counts["error"] += 1
+            continue
+        except Exception as exc:  # noqa: BLE001 - 单项异常必须隔离，不能影响其他项
+            logger.exception("批量审计第 %d 项求解/落库失败", index)
+            results.append(
+                BatchAuditItem(
+                    index=index,
+                    error=BatchItemError(
+                        code="solver_error",
+                        message=f"求解或持久化失败: {exc}",
+                    ),
+                )
+            )
+            counts["error"] += 1
+            continue
+
+        results.append(
+            BatchAuditItem(
+                index=index,
+                audit_id=audit.id,
+                status=audit.status,
+                audit=audit,
+            )
+        )
+        counts[audit.status] += 1
+
+    total = len(payload.manifests)
+    return BatchAuditResponse(
+        total=total,
+        feasible=counts["feasible"],
+        infeasible=counts["infeasible"],
+        inconclusive=counts["inconclusive"],
+        error=counts["error"],
+        counts=BatchAuditCounts(total=total, **counts),
+        results=results,
+    )
 
 
 @app.get("/api/v1/audits", response_model=dict, tags=["audits"])
